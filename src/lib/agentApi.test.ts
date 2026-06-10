@@ -225,4 +225,42 @@ describe('callAgentResponsesApi', () => {
     expect(result.text).toBe('See [OpenAI docs](https://platform.openai.com/docs).')
     expect(result.outputItems?.[0]).toMatchObject({ type: 'web_search_call', status: 'completed' })
   })
+
+  it('injects configurable math formatting instructions', async () => {
+    const createResponse = () => new Response(JSON.stringify({
+      output: [{
+        type: 'message',
+        content: [{ type: 'output_text', text: 'OK' }],
+      }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => createResponse())
+    const profile = createDefaultOpenAIProfile({
+      apiKey: 'test-key',
+      apiMode: 'responses',
+    })
+
+    await callAgentResponsesApi({
+      settings: DEFAULT_SETTINGS,
+      profile,
+      params: DEFAULT_PARAMS,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'prompt' }] }],
+    })
+
+    let body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))
+    expect(body.instructions).toContain('## Math formatting')
+    expect(body.instructions).toContain('Use `$...$` for inline formulas.')
+
+    await callAgentResponsesApi({
+      settings: { ...DEFAULT_SETTINGS, agentMathFormattingPrompt: false },
+      profile,
+      params: DEFAULT_PARAMS,
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'prompt' }] }],
+    })
+
+    body = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))
+    expect(body.instructions).not.toContain('## Math formatting')
+  })
 })

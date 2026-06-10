@@ -107,6 +107,7 @@ export interface AppSettings {
   agentScrollToBottomAfterSubmit: boolean
   agentMaxToolRounds: number
   agentWebSearch: boolean
+  agentMathFormattingPrompt: boolean
   profiles: ApiProfile[]
   activeProfileId: string
 }
