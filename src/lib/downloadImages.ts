@@ -1,6 +1,7 @@
 import { zipSync } from 'fflate'
 import type { TaskRecord } from '../types'
 import { ensureImageCached } from '../store'
+import { getNumberedFileNameBase, sanitizeFileNamePart } from './exportFileName'
 
 const MIME_EXTENSIONS: Record<string, string> = {
   'image/png': 'png',
@@ -95,10 +96,9 @@ export function getTaskOutputImageZipEntries(tasks: TaskOutputZipTask[]): Downlo
 }
 
 export function getImageZipEntries(imageIds: string[], fileNameBase = 'image'): DownloadImageZipEntry[] {
-  const multiple = imageIds.length > 1
   return imageIds.map((imageId, index) => ({
     imageId,
-    fileNameBase: multiple ? `${fileNameBase}-${String(index + 1).padStart(2, '0')}` : fileNameBase,
+    fileNameBase: getNumberedFileNameBase(fileNameBase, index, imageIds.length),
   }))
 }
 
@@ -126,10 +126,6 @@ function triggerDownload(blob: Blob, fileName: string) {
 
 function getBlobExtension(blob: Blob): string {
   return MIME_EXTENSIONS[blob.type.toLowerCase()] ?? blob.type.split('/')[1] ?? 'png'
-}
-
-function sanitizeFileNamePart(value: string): string {
-  return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]+/g, '-').replace(/\s+/g, ' ').slice(0, 120)
 }
 
 function delay(ms: number) {
