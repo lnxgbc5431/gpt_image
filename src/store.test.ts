@@ -129,7 +129,7 @@ vi.mock('./lib/agentApi', () => ({
     }
   }),
 }))
-import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllTasks, getImage, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
+import { clearAgentConversations, clearImages, clearTasks, getAllAgentConversations, getAllImageIds, getAllTasks, getImage, putAgentConversation, putImage, putTask as putDbTask } from './lib/db'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { getFalQueuedImageResult } from './lib/falAiImageApi'
 import { removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
@@ -2428,6 +2428,52 @@ describe('task deletion', () => {
     expect(state.showToast).toHaveBeenCalledWith('任务已删除', 'success')
   })
 
+  it('preserves concurrent task deletion, creation, and updates', async () => {
+    const rawResponsePayload = JSON.stringify({
+      output: [
+        { type: 'image_generation_call', id: 'call-a', result: 'base64-a' },
+        { type: 'image_generation_call', id: 'call-b', result: 'base64-b' },
+      ],
+    })
+    const deletedA = task({ id: 'task-a', sourceMode: 'agent', agentRoundId: 'round-a', agentToolCallId: 'call-a' })
+    const deletedB = task({ id: 'task-b', sourceMode: 'agent', agentRoundId: 'round-a', agentToolCallId: 'call-b' })
+    const existing = task({ id: 'task-existing', rawResponsePayload, sourceMode: 'agent', agentRoundId: 'round-a' })
+    const created = task({ id: 'task-created' })
+    useStore.setState({
+      tasks: [deletedA, deletedB, existing],
+      selectedTaskIds: [deletedA.id, deletedB.id],
+      agentConversations: [agentConversation({
+        rounds: [{
+          id: 'round-a',
+          index: 1,
+          userMessageId: 'message-a',
+          prompt: 'prompt',
+          inputImageIds: [],
+          outputTaskIds: [deletedA.id, deletedB.id],
+          responseOutput: JSON.parse(rawResponsePayload).output,
+          status: 'done',
+          error: null,
+          createdAt: 1,
+          finishedAt: 2,
+        }],
+      })],
+    })
+
+    const deletionA = removeTask(deletedA)
+    const deletionB = removeTask(deletedB)
+    useStore.setState((state) => ({
+      tasks: [created, ...state.tasks.map((item) => item.id === existing.id ? { ...item, prompt: 'updated' } : item)],
+    }))
+    await Promise.all([deletionA, deletionB])
+
+    const state = useStore.getState()
+    expect(state.tasks.map((item) => item.id)).toEqual([created.id, existing.id])
+    expect(state.tasks.find((item) => item.id === existing.id)?.prompt).toBe('updated')
+    expect(state.tasks.find((item) => item.id === existing.id)?.rawResponsePayload).not.toContain('base64-a')
+    expect(state.tasks.find((item) => item.id === existing.id)?.rawResponsePayload).not.toContain('base64-b')
+    expect(state.selectedTaskIds).toEqual([])
+  })
+
   it('counts duplicate and missing ids only when they match an existing task', async () => {
     const deleted = task({ id: 'task-deleted' })
     const remaining = task({ id: 'task-remaining' })
@@ -2442,6 +2488,54 @@ describe('task deletion', () => {
     expect(state.selectedTaskIds).toEqual([])
     expect((await getAllTasks()).map((item) => item.id)).toEqual([remaining.id])
     expect(state.showToast).toHaveBeenCalledWith('已删除 1 个任务', 'success')
+  })
+
+  it('does not show a success toast when no task id exists', async () => {
+    const showToast = vi.fn()
+    useStore.setState({ selectedTaskIds: ['task-missing'], showToast })
+
+    await removeMultipleTasks(['task-missing', 'task-missing'])
+    await removeTask(task({ id: 'another-missing-task' }))
+
+    expect(useStore.getState().selectedTaskIds).toEqual([])
+    expect(showToast).not.toHaveBeenCalled()
+  })
+
+  it('removes gallery output images stored while the task is being deleted', async () => {
+    const { callImageApi } = await import('./lib/api')
+    let resolvePostProcess: (dataUrl: string) => void = () => {}
+    vi.mocked(callImageApi).mockResolvedValueOnce({
+      images: ['data:image/png;base64,late-gallery-output'],
+      actualParams: {},
+      actualParamsList: [],
+      revisedPrompts: [],
+    })
+    vi.mocked(removeKeyedBackgroundFromDataUrl).mockImplementationOnce(() => new Promise((resolve) => {
+      resolvePostProcess = resolve
+    }))
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, apiKey: 'test-key' },
+      appMode: 'gallery',
+      prompt: 'prompt',
+      params: { ...DEFAULT_PARAMS, output_format: 'png', transparent_output: true },
+    })
+
+    await submitTask()
+    for (let i = 0; i < 10 && !vi.mocked(removeKeyedBackgroundFromDataUrl).mock.calls.length; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    const runningTask = useStore.getState().tasks[0]
+    expect(runningTask?.status).toBe('running')
+    expect(await getAllImageIds()).toHaveLength(1)
+
+    await removeTask(runningTask)
+    resolvePostProcess('data:image/png;base64,late-transparent-output')
+    for (let i = 0; i < 10 && (await getAllImageIds()).length > 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    expect(useStore.getState().tasks).toEqual([])
+    expect(await getAllImageIds()).toEqual([])
   })
 
   it('keeps deleted-task images that remain referenced by tasks, Agent state, or drafts', async () => {
@@ -2671,6 +2765,58 @@ describe('agent built-in image tool failure', () => {
       content: '图片失败，但回复继续。',
       outputTaskIds: [failedTask.id],
     })
+  })
+
+  it('does not restore a deleted Agent task when its image and final response arrive late', async () => {
+    let deletedTaskId = ''
+    let liveTaskId = ''
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-deleted' })
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-live' })
+      const runningTask = useStore.getState().tasks.find((item) => item.agentToolCallId === 'ig-deleted')
+      const liveTask = useStore.getState().tasks.find((item) => item.agentToolCallId === 'ig-live')
+      if (!runningTask) throw new Error('Agent task was not created')
+      if (!liveTask) throw new Error('Live Agent task was not created')
+      deletedTaskId = runningTask.id
+      liveTaskId = liveTask.id
+      await removeTask(runningTask)
+      await opts.onImageToolCompleted?.({
+        toolCallId: 'ig-deleted',
+        dataUrl: 'data:image/png;base64,late-agent-output',
+      })
+      const outputItems = [
+        { type: 'image_generation_call' as const, id: 'ig-deleted', result: 'late-agent-base64' },
+        { type: 'image_generation_call' as const, id: 'ig-live', result: 'live-agent-base64' },
+      ]
+      return {
+        text: '',
+        images: [],
+        outputItems,
+        rawResponsePayload: JSON.stringify({ output: outputItems }),
+        responseId: 'response-late',
+      }
+    })
+
+    await submitAgentMessage()
+    for (let i = 0; i < 10 && useStore.getState().agentConversations[0].rounds[0]?.status !== 'done'; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const state = useStore.getState()
+    const round = state.agentConversations[0].rounds[0]
+    const assistantMessage = state.agentConversations[0].messages.find((message) => message.role === 'assistant')
+    expect(deletedTaskId).not.toBe('')
+    expect(liveTaskId).not.toBe('')
+    expect(state.tasks.map((item) => item.id)).toEqual([liveTaskId])
+    expect((await getAllTasks()).map((item) => item.id)).toEqual([liveTaskId])
+    expect(await getAllImageIds()).toEqual([])
+    expect(round.outputTaskIds).toEqual([liveTaskId])
+    expect(JSON.stringify(round.responseOutput)).not.toContain('ig-deleted')
+    expect(JSON.stringify(round.responseOutput)).not.toContain('late-agent-base64')
+    expect(JSON.stringify(round.responseOutput)).toContain('ig-live')
+    expect(state.tasks[0].rawResponsePayload).not.toContain('ig-deleted')
+    expect(state.tasks[0].rawResponsePayload).toContain('ig-live')
+    expect(assistantMessage?.outputTaskIds).toEqual([liveTaskId])
   })
 })
 
