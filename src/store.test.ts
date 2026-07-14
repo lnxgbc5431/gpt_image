@@ -2408,6 +2408,8 @@ describe('task deletion', () => {
       galleryInputDraft: null,
       agentInputDrafts: {},
       agentConversations: [],
+      streamPreviews: {},
+      streamPreviewSlots: {},
       showToast: vi.fn(),
     })
   })
@@ -2536,6 +2538,40 @@ describe('task deletion', () => {
 
     expect(useStore.getState().tasks).toEqual([])
     expect(await getAllImageIds()).toEqual([])
+  })
+
+  it('clears stream previews and ignores partial images arriving after deletion', async () => {
+    const { callImageApi } = await import('./lib/api')
+    let emitPartialImage: () => void = () => {}
+    let resolveApi: (result: Awaited<ReturnType<typeof callImageApi>>) => void = () => {}
+    vi.mocked(callImageApi).mockImplementationOnce((opts) => {
+      emitPartialImage = () => opts.onPartialImage?.({ image: 'data:image/png;base64,partial', requestIndex: 1 })
+      return new Promise((resolve) => { resolveApi = resolve })
+    })
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, apiKey: 'test-key' },
+      appMode: 'gallery',
+      prompt: 'prompt',
+      params: { ...DEFAULT_PARAMS },
+    })
+
+    await submitTask()
+    for (let i = 0; i < 10 && !vi.mocked(callImageApi).mock.calls.length; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    const runningTask = useStore.getState().tasks[0]
+    emitPartialImage()
+    expect(useStore.getState().streamPreviews[runningTask.id]).toContain('partial')
+    expect(useStore.getState().streamPreviewSlots[runningTask.id]?.['1']).toContain('partial')
+
+    await removeTask(runningTask)
+    expect(useStore.getState().streamPreviews[runningTask.id]).toBeUndefined()
+    expect(useStore.getState().streamPreviewSlots[runningTask.id]).toBeUndefined()
+    emitPartialImage()
+    expect(useStore.getState().streamPreviews[runningTask.id]).toBeUndefined()
+    expect(useStore.getState().streamPreviewSlots[runningTask.id]).toBeUndefined()
+
+    resolveApi({ images: [], actualParams: {}, actualParamsList: [], revisedPrompts: [] })
   })
 
   it('keeps deleted-task images that remain referenced by tasks, Agent state, or drafts', async () => {
@@ -2798,7 +2834,9 @@ describe('agent built-in image tool failure', () => {
     })
 
     await submitAgentMessage()
-    for (let i = 0; i < 10 && useStore.getState().agentConversations[0].rounds[0]?.status !== 'done'; i += 1) {
+    for (let i = 0; i < 20; i += 1) {
+      const state = useStore.getState()
+      if (state.agentConversations[0].rounds[0]?.status === 'done' && !state.tasks[0]?.rawResponsePayload?.includes('ig-deleted')) break
       await new Promise((resolve) => setTimeout(resolve, 0))
     }
 
@@ -2817,6 +2855,112 @@ describe('agent built-in image tool failure', () => {
     expect(state.tasks[0].rawResponsePayload).not.toContain('ig-deleted')
     expect(state.tasks[0].rawResponsePayload).toContain('ig-live')
     expect(assistantMessage?.outputTaskIds).toEqual([liveTaskId])
+  })
+
+  it('cleans late response output after an Agent failure', async () => {
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-deleted-failure' })
+      const runningTask = useStore.getState().tasks.find((item) => item.agentToolCallId === 'ig-deleted-failure')
+      if (!runningTask) throw new Error('Agent task was not created')
+      await removeTask(runningTask)
+      opts.onOutputItems?.([{ type: 'image_generation_call', id: 'ig-deleted-failure', result: 'late-failure-base64' }])
+      throw new Error('stream failed')
+    })
+
+    await submitAgentMessage()
+    for (let i = 0; i < 20; i += 1) {
+      const round = useStore.getState().agentConversations[0].rounds[0]
+      if (round?.status === 'error' && !JSON.stringify(round.responseOutput).includes('ig-deleted-failure')) break
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const round = useStore.getState().agentConversations[0].rounds[0]
+    expect(round).toMatchObject({ status: 'error', error: 'stream failed' })
+    expect(JSON.stringify(round.responseOutput)).not.toContain('ig-deleted-failure')
+    expect(JSON.stringify(round.responseOutput)).not.toContain('late-failure-base64')
+  })
+
+  it('cleans late response output after an Agent abort', async () => {
+    let ready: () => void = () => {}
+    const outputWritten = new Promise<void>((resolve) => { ready = resolve })
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-deleted-abort' })
+      const runningTask = useStore.getState().tasks.find((item) => item.agentToolCallId === 'ig-deleted-abort')
+      if (!runningTask) throw new Error('Agent task was not created')
+      await removeTask(runningTask)
+      opts.onOutputItems?.([{ type: 'image_generation_call', id: 'ig-deleted-abort', result: 'late-abort-base64' }])
+      ready()
+      const signal = opts.signal
+      if (!signal) throw new Error('Abort signal was not provided')
+      return new Promise((_, reject) => {
+        const abort = () => reject(new DOMException('Agent 请求已停止', 'AbortError'))
+        if (signal.aborted) abort()
+        else signal.addEventListener('abort', abort, { once: true })
+      })
+    })
+
+    await submitAgentMessage()
+    await outputWritten
+    stopAgentResponse('conversation-a')
+    for (let i = 0; i < 20; i += 1) {
+      const round = useStore.getState().agentConversations[0].rounds[0]
+      if (round?.status === 'error' && !JSON.stringify(round.responseOutput).includes('ig-deleted-abort')) break
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const round = useStore.getState().agentConversations[0].rounds[0]
+    expect(round).toMatchObject({ status: 'error', error: '已停止生成。' })
+    expect(JSON.stringify(round.responseOutput)).not.toContain('ig-deleted-abort')
+    expect(JSON.stringify(round.responseOutput)).not.toContain('late-abort-base64')
+  })
+
+  it('cleans late response output when Agent execution pauses for recovery', async () => {
+    const { callImageApi } = await import('./lib/api')
+    const falProfile = createDefaultFalProfile({ id: 'fal-profile', apiKey: 'fal-key' })
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        profiles: [responsesProfile, falProfile],
+        activeProfileId: responsesProfile.id,
+        agentApiConfigMode: 'hybrid',
+        agentTextProfileId: responsesProfile.id,
+        agentImageProfileId: falProfile.id,
+      }),
+    })
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-deleted-recovery' })
+      const runningTask = useStore.getState().tasks.find((item) => item.agentToolCallId === 'ig-deleted-recovery')
+      if (!runningTask) throw new Error('Agent task was not created')
+      await removeTask(runningTask)
+      const outputItems = [
+        { type: 'image_generation_call' as const, id: 'ig-deleted-recovery', result: 'late-recovery-base64' },
+        { type: 'function_call' as const, name: 'generate_image', call_id: 'recovery-call', arguments: JSON.stringify({ id: 'image', prompt: '画一张图' }) },
+      ]
+      opts.onOutputItems?.(outputItems)
+      return { text: '', images: [], outputItems, responseId: 'response-recovery' }
+    })
+    vi.mocked(callImageApi).mockImplementationOnce(async (opts) => {
+      opts.onFalRequestEnqueued?.({ requestId: 'fal-request', endpoint: 'fal-endpoint' })
+      throw new Error('Failed to fetch')
+    })
+
+    await submitAgentMessage()
+    for (let i = 0; i < 20; i += 1) {
+      const state = useStore.getState()
+      const recoveryTask = state.tasks.find((item) => item.agentToolCallId === 'recovery-call')
+      const responseOutput = JSON.stringify(state.agentConversations[0].rounds[0]?.responseOutput)
+      if (recoveryTask?.falRecoverable && !responseOutput.includes('ig-deleted-recovery')) break
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const state = useStore.getState()
+    const recoveryTask = state.tasks.find((item) => item.agentToolCallId === 'recovery-call')
+    expect(recoveryTask).toMatchObject({ status: 'error', falRecoverable: true })
+    expect(callAgentResponsesApi).toHaveBeenCalledTimes(1)
+    expect(state.agentConversations[0].rounds[0].status).toBe('running')
+    expect(JSON.stringify(state.agentConversations[0].rounds[0].responseOutput)).not.toContain('ig-deleted-recovery')
+    expect(JSON.stringify(state.agentConversations[0].rounds[0].responseOutput)).not.toContain('late-recovery-base64')
+    await removeTask(recoveryTask!)
   })
 })
 

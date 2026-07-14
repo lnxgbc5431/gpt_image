@@ -71,7 +71,7 @@ const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const agentRoundControllers = new Map<string, AbortController>()
 const agentRecoveryContinuations = new Set<string>()
-const deletedActiveAgentTasks = new Map<string, TaskRecord>()
+const deletedActiveAgentTasks = new Map<string, { task: TaskRecord; controller: AbortController }>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
 const OPENAI_INTERRUPTED_ERROR = '请求中断'
@@ -1216,6 +1216,7 @@ export const useStore = create<AppState>()(
       streamPreviewSlots: {},
       setTaskStreamPreview: (taskId, image, requestIndex = 0) => set((s) => {
         if (image) {
+          if (!s.tasks.some((task) => task.id === taskId)) return s
           const slotKey = String(requestIndex)
           const currentSlots = s.streamPreviewSlots[taskId] ?? {}
           if (s.streamPreviews[taskId] === image && currentSlots[slotKey] === image) return s
@@ -2183,6 +2184,12 @@ function getAgentRoundControllerKey(conversationId: string, roundId: string) {
   return `${conversationId}:${roundId}`
 }
 
+function getDeletedActiveAgentTasks(conversationId: string, roundId: string, controller: AbortController) {
+  return Array.from(deletedActiveAgentTasks.values())
+    .filter((entry) => entry.controller === controller && entry.task.agentConversationId === conversationId && entry.task.agentRoundId === roundId)
+    .map((entry) => entry.task)
+}
+
 function createAgentAbortError() {
   return new DOMException('Agent 请求已停止', 'AbortError')
 }
@@ -2673,7 +2680,7 @@ function scrubTaskRawResponsePayloadForDeletedTasks(task: TaskRecord, conversati
     .find((item) => item.id === task.agentRoundId)
   if (!round) return task
 
-  const roundDeletedTasks = deletedTasks.filter((item) => round.outputTaskIds.includes(item.id))
+  const roundDeletedTasks = deletedTasks.filter((item) => item.agentRoundId === round.id)
   if (roundDeletedTasks.length === 0) return task
 
   try {
@@ -4115,20 +4122,13 @@ async function executeAgentRound(
       (task) => Boolean(task.agentToolCallId && !task.agentBatchCallId),
     )
 
-    const deletedTasksBeforeFinal = Array.from(deletedActiveAgentTasks.values()).filter(
-      (task) => task.agentConversationId === conversationId && task.agentRoundId === roundId,
-    )
-    await scrubAgentOutputPayloadsForDeletedTasks(deletedTasksBeforeFinal)
-
     const latestTasks = useStore.getState().tasks
     const existingTaskIds = new Set(latestTasks.map((task) => task.id))
     const taskIds = streamingTaskIds.filter((taskId) => existingTaskIds.has(taskId))
     const outputIds = taskIds.flatMap((taskId) => latestTasks.find((task) => task.id === taskId)?.outputImages ?? [])
     const latestConversation = useStore.getState().agentConversations.find((item) => item.id === conversationId)
     const latestRound = latestConversation?.rounds.find((item) => item.id === roundId)
-    const deletedTasks = Array.from(deletedActiveAgentTasks.values()).filter(
-      (task) => task.agentConversationId === conversationId && task.agentRoundId === roundId,
-    )
+    const deletedTasks = getDeletedActiveAgentTasks(conversationId, roundId, controller)
     const responseOutput = latestRound
       ? scrubResponseOutputForDeletedAgentTasks(latestRound, accumulatedOutputItems, deletedTasks)
       : accumulatedOutputItems
@@ -4235,8 +4235,15 @@ async function executeAgentRound(
     if (agentRoundControllers.get(controllerKey) === controller) {
       agentRoundControllers.delete(controllerKey)
     }
-    for (const [taskId, task] of deletedActiveAgentTasks) {
-      if (task.agentConversationId === conversationId && task.agentRoundId === roundId) deletedActiveAgentTasks.delete(taskId)
+    const deletedTasks = getDeletedActiveAgentTasks(conversationId, roundId, controller)
+    try {
+      await scrubAgentOutputPayloadsForDeletedTasks(deletedTasks)
+    } catch (err) {
+      console.warn('清理已删除 Agent 任务的响应失败', err)
+    } finally {
+      for (const task of deletedTasks) {
+        if (deletedActiveAgentTasks.get(task.id)?.controller === controller) deletedActiveAgentTasks.delete(task.id)
+      }
     }
   }
 }
@@ -4783,9 +4790,17 @@ async function removeTasks(taskIds: string[]) {
   let deletedTasks: TaskRecord[] = []
   useStore.setState((state) => {
     deletedTasks = state.tasks.filter((task) => toDelete.has(task.id))
+    const streamPreviews = { ...state.streamPreviews }
+    const streamPreviewSlots = { ...state.streamPreviewSlots }
+    for (const taskId of toDelete) {
+      delete streamPreviews[taskId]
+      delete streamPreviewSlots[taskId]
+    }
     return {
       tasks: state.tasks.filter((task) => !toDelete.has(task.id)),
       selectedTaskIds: state.selectedTaskIds.filter((id) => !toDelete.has(id)),
+      streamPreviews,
+      streamPreviewSlots,
     }
   })
   if (deletedTasks.length === 0) return 0
@@ -4793,13 +4808,10 @@ async function removeTasks(taskIds: string[]) {
   const deletedImageIds = new Set<string>()
   for (const task of deletedTasks) {
     addTaskReferencedImageIds(deletedImageIds, task)
-    if (
-      task.agentConversationId &&
-      task.agentRoundId &&
-      agentRoundControllers.has(getAgentRoundControllerKey(task.agentConversationId, task.agentRoundId))
-    ) {
-      deletedActiveAgentTasks.set(task.id, task)
-    }
+    const controller = task.agentConversationId && task.agentRoundId
+      ? agentRoundControllers.get(getAgentRoundControllerKey(task.agentConversationId, task.agentRoundId))
+      : undefined
+    if (controller) deletedActiveAgentTasks.set(task.id, { task, controller })
     clearFalRecoveryTimer(task.id)
     clearCustomRecoveryTimer(task.id)
     clearOpenAIWatchdogTimer(task.id)
