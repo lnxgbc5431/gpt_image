@@ -154,6 +154,14 @@ export interface MaskDraft {
   updatedAt: number
 }
 
+export interface AgentInputDraft {
+  prompt: string
+  inputImages: InputImage[]
+  maskDraft: MaskDraft | null
+  maskEditorImageId: string | null
+  updatedAt?: number
+}
+
 // ===== 任务记录 =====
 
 export type TaskStatus = 'running' | 'done' | 'error'

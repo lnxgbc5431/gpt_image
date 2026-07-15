@@ -6,6 +6,7 @@ import type { AgentConversation, ExportData, StoredImage, StoredImageThumbnail, 
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
 import { hasActiveDataOperations } from './lib/dataOperations'
 import { deleteAgentRoundFromConversation, getActiveAgentRounds, getAgentConversationTaskIds, getAgentRoundTaskIds, remapAgentRoundMentionsForPathChange } from './lib/agentConversationState'
+import { cleanStaleAgentInputDrafts } from './lib/inputDraftState'
 vi.mock('./lib/db', () => {
   const tasks = new Map<string, TaskRecord>()
   const images = new Map<string, StoredImage>()
@@ -133,7 +134,7 @@ import { callImageApi } from './lib/api'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { getFalQueuedImageResult } from './lib/falAiImageApi'
 import { removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
-import { cleanStaleAgentInputDrafts, clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
+import { clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, migratePersistedState, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
 
 const commitTaskDeletionImplementation = vi.mocked(commitTaskDeletion).getMockImplementation()!
 const deleteDbImageImplementation = vi.mocked(deleteDbImage).getMockImplementation()!
@@ -588,6 +589,7 @@ describe('input persistence setting', () => {
 
     expect(persisted).not.toHaveProperty('prompt')
     expect(persisted).not.toHaveProperty('inputImages')
+    expect(persisted.galleryInputDraft).toBeNull()
   })
 
   it('writes empty input when persisted input is cleared', () => {
@@ -720,6 +722,108 @@ describe('agent conversation persistence', () => {
     expect(state.activeAgentConversationId).toBe('stored-conversation')
     expect(state.agentInputDrafts['stored-conversation']?.prompt).toBe('未发送草稿')
     expect(state.prompt).toBe('未发送草稿')
+  })
+
+  it('clears masks and renumbers mentions when startup cannot restore a draft image', async () => {
+    await clearTasks()
+    await clearImages()
+    await clearAgentConversations()
+    const conversation = agentConversation({ id: 'restore-conversation' })
+    await putAgentConversation(conversation)
+    await putImage(imageB)
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS },
+      appMode: 'agent',
+      tasks: [],
+      agentConversations: [conversation],
+      activeAgentConversationId: conversation.id,
+      agentInputDrafts: {
+        [conversation.id]: {
+          prompt: `保留 ${getSelectedImageMentionLabel(1)}，缺失 ${getSelectedImageMentionLabel(0)}`,
+          inputImages: [
+            { id: imageA.id, dataUrl: '' },
+            { id: imageB.id, dataUrl: '' },
+          ],
+          maskDraft: {
+            targetImageId: imageA.id,
+            maskDataUrl: 'data:image/png;base64,mask',
+            updatedAt: 1,
+          },
+          maskEditorImageId: imageA.id,
+          updatedAt: 2,
+        },
+      },
+      galleryInputDraft: null,
+      prompt: '',
+      inputImages: [],
+      maskDraft: null,
+      maskEditorImageId: null,
+    })
+
+    await initStore()
+
+    const state = useStore.getState()
+    const expectedPrompt = `保留 ${getSelectedImageMentionLabel(0)}，缺失 @已移除图片`
+    expect(state.agentInputDrafts[conversation.id]).toMatchObject({
+      prompt: expectedPrompt,
+      inputImages: [imageB],
+      maskDraft: null,
+      maskEditorImageId: null,
+      updatedAt: 2,
+    })
+    expect(state.prompt).toBe(expectedPrompt)
+    expect(state.inputImages).toEqual([imageB])
+    expect(state.maskDraft).toBeNull()
+    expect(state.maskEditorImageId).toBeNull()
+  })
+
+  it('clears gallery masks and renumbers mentions when startup cannot restore a draft image', async () => {
+    await clearTasks()
+    await clearImages()
+    await clearAgentConversations()
+    await putImage(imageB)
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS },
+      appMode: 'gallery',
+      tasks: [],
+      agentConversations: [],
+      activeAgentConversationId: null,
+      agentInputDrafts: {},
+      galleryInputDraft: {
+        prompt: `保留 ${getSelectedImageMentionLabel(1)}，缺失 ${getSelectedImageMentionLabel(0)}`,
+        inputImages: [
+          { id: imageA.id, dataUrl: '' },
+          { id: imageB.id, dataUrl: '' },
+        ],
+        maskDraft: {
+          targetImageId: imageA.id,
+          maskDataUrl: 'data:image/png;base64,mask',
+          updatedAt: 1,
+        },
+        maskEditorImageId: imageA.id,
+        updatedAt: 2,
+      },
+      prompt: '',
+      inputImages: [],
+      maskDraft: null,
+      maskEditorImageId: null,
+    })
+
+    await initStore()
+
+    const state = useStore.getState()
+    const expectedPrompt = `保留 ${getSelectedImageMentionLabel(0)}，缺失 @已移除图片`
+    expect(state.galleryInputDraft).toMatchObject({
+      prompt: expectedPrompt,
+      inputImages: [imageB],
+      maskDraft: null,
+      maskEditorImageId: null,
+      updatedAt: 2,
+    })
+    expect(state.prompt).toBe(expectedPrompt)
+    expect(state.inputImages).toEqual([imageB])
+    expect(state.maskDraft).toBeNull()
+    expect(state.maskEditorImageId).toBeNull()
   })
 
   it('strips generated image payloads when migrating old persisted state', () => {

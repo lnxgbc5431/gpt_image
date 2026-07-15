@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type {
   AgentConversation,
+  AgentInputDraft,
   AgentMessage,
   AgentRound,
   ApiMode,
@@ -60,6 +61,7 @@ import { formatExportFileTime } from './lib/exportFileName'
 import { buildExportZip, createExportBlob, getExportImageEstimatedBytes, getExportZipPlan, MAX_EXPORT_ZIP_BYTES, readExportZip, readExportZipFileAsDataUrl, readExportZipManifest } from './lib/exportZip'
 import { deleteAgentRoundFromConversation, getActiveAgentRounds, getAgentRoundPath, normalizeAgentConversations, remapAgentRoundMentionsForPathChange, uniqueIds } from './lib/agentConversationState'
 import { canonicalizeBatchFunctionCallArguments, countResponseToolCalls, createReadyAgentRecoveredToolState, getAgentFunctionOutputCallIds, getAgentRecoveredFailureError, getAgentRecoveredToolCallCount, getAgentRoundResponseOutput, getPersistableAgentConversations, getPersistableRawResponsePayload, mergeResponseOutputItems, sanitizeResponseOutputForInput, scrubResponseOutputForDeletedAgentTasks, scrubTaskRawResponsePayloadForDeletedTasks, stripPersistedAgentConversations } from './lib/agentResponseState'
+import { cleanStaleAgentInputDrafts, clearInputDraftState, getPersistableAgentInputDrafts, isEmptyAgentInputDraft, normalizeAgentInputDraft, normalizeAgentInputDrafts, normalizeAgentInputDraftsByKey, remapAgentInputDraftMentionsForPathChange, restoreAgentInputDraftState, restoreGalleryInputDraftState, saveActiveAgentInputDrafts, saveGalleryInputDraft, syncActiveInputDraft, updateInputDraftImages } from './lib/inputDraftState'
 
 export const ALL_FAVORITES_COLLECTION_ID = '__all_favorites__'
 export const DEFAULT_FAVORITE_COLLECTION_ID = '__default_favorites__'
@@ -68,7 +70,6 @@ export const DEFAULT_FAVORITE_COLLECTION_NAME = '默认'
 const FAL_RECOVERY_POLL_MS = 10_000
 const CUSTOM_RECOVERY_POLL_MS = 10_000
 const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
-const AGENT_INPUT_DRAFT_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -84,13 +85,6 @@ const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
 const ERROR_TOAST_MAX_LENGTH = 80
 type ToastType = 'info' | 'success' | 'error'
 type AgentDeletionResult = 'deleted' | 'deleted-with-warning' | 'running' | 'not-found'
-type AgentInputDraft = {
-  prompt: string
-  inputImages: InputImage[]
-  maskDraft: MaskDraft | null
-  maskEditorImageId: string | null
-  updatedAt?: number
-}
 
 export function getErrorToastMessage(message: string): string {
   const text = message.trim()
@@ -329,7 +323,7 @@ function getLatestAgentConversation(conversations: AgentConversation[]) {
 
 export function getPersistedState(state: AppState) {
   const settings = normalizeSettings(state.settings)
-  const galleryInputDraft = getPersistableGalleryInputDraft(state)
+  const galleryInputDraft = saveGalleryInputDraft(state)
   return {
     settings,
     params: state.params,
@@ -655,181 +649,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
 
-function normalizeInputImages(value: unknown): InputImage[] {
-  if (!Array.isArray(value)) return []
-  return value
-    .map((img): InputImage | null => {
-      if (!isRecord(img) || typeof img.id !== 'string') return null
-      return { id: img.id, dataUrl: typeof img.dataUrl === 'string' ? img.dataUrl : '' }
-    })
-    .filter((img): img is InputImage => img != null)
-}
-
-function normalizeMaskDraft(value: unknown): MaskDraft | null {
-  if (!isRecord(value)) return null
-  if (typeof value.targetImageId !== 'string' || typeof value.maskDataUrl !== 'string') return null
-  return {
-    targetImageId: value.targetImageId,
-    maskDataUrl: value.maskDataUrl,
-    updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : Date.now(),
-  }
-}
-
-function normalizeAgentInputDraft(value: unknown, fallbackUpdatedAt = Date.now()): AgentInputDraft {
-  const draft = isRecord(value) ? value : {}
-  const updatedAt = typeof draft.updatedAt === 'number' && Number.isFinite(draft.updatedAt) ? draft.updatedAt : fallbackUpdatedAt
-  return {
-    prompt: typeof draft.prompt === 'string' ? draft.prompt : '',
-    inputImages: normalizeInputImages(draft.inputImages),
-    maskDraft: normalizeMaskDraft(draft.maskDraft),
-    maskEditorImageId: typeof draft.maskEditorImageId === 'string' ? draft.maskEditorImageId : null,
-    updatedAt,
-  }
-}
-
-function normalizeAgentInputDrafts(value: unknown, conversations: AgentConversation[]): Record<string, AgentInputDraft> {
-  if (!isRecord(value)) return {}
-  const conversationIds = new Set(conversations.map((conversation) => conversation.id))
-  const drafts: Record<string, AgentInputDraft> = {}
-  for (const [conversationId, draft] of Object.entries(value)) {
-    if (!conversationIds.has(conversationId)) continue
-    const normalized = normalizeAgentInputDraft(draft)
-    if (!isEmptyAgentInputDraft(normalized)) drafts[conversationId] = normalized
-  }
-  return drafts
-}
-
-function normalizeAgentInputDraftsByKey(value: unknown): Record<string, AgentInputDraft> {
-  if (!isRecord(value)) return {}
-  const drafts: Record<string, AgentInputDraft> = {}
-  for (const [conversationId, draft] of Object.entries(value)) {
-    const normalized = normalizeAgentInputDraft(draft)
-    if (!isEmptyAgentInputDraft(normalized)) drafts[conversationId] = normalized
-  }
-  return drafts
-}
-
-export function cleanStaleAgentInputDrafts(drafts: Record<string, AgentInputDraft>, activeConversationId: string | null, now = Date.now()) {
-  const cutoff = now - AGENT_INPUT_DRAFT_RETENTION_MS
-  const next: Record<string, AgentInputDraft> = {}
-  for (const [conversationId, draft] of Object.entries(drafts)) {
-    if (conversationId === activeConversationId || (draft.updatedAt ?? now) >= cutoff) {
-      next[conversationId] = draft
-    }
-  }
-  return next
-}
-
-function clearInputDraftState(): Pick<AgentInputDraft, 'prompt' | 'inputImages' | 'maskDraft' | 'maskEditorImageId'> {
-  return {
-    prompt: '',
-    inputImages: [],
-    maskDraft: null,
-    maskEditorImageId: null,
-  }
-}
-
-function copyAgentInputDraft(draft: AgentInputDraft): AgentInputDraft {
-  return {
-    prompt: draft.prompt,
-    inputImages: draft.inputImages.map((img) => ({ ...img })),
-    maskDraft: draft.maskDraft ? { ...draft.maskDraft } : null,
-    maskEditorImageId: draft.maskEditorImageId,
-    updatedAt: draft.updatedAt ?? Date.now(),
-  }
-}
-
-function getCurrentAgentInputDraft(state: Pick<AppState, 'prompt' | 'inputImages' | 'maskDraft' | 'maskEditorImageId'>): AgentInputDraft {
-  return {
-    prompt: state.prompt,
-    inputImages: state.inputImages,
-    maskDraft: state.maskDraft,
-    maskEditorImageId: state.maskEditorImageId,
-    updatedAt: Date.now(),
-  }
-}
-
-function isEmptyAgentInputDraft(draft: AgentInputDraft) {
-  return draft.prompt.length === 0 && draft.inputImages.length === 0 && !draft.maskDraft && !draft.maskEditorImageId
-}
-
-function setAgentInputDraft(drafts: Record<string, AgentInputDraft>, conversationId: string, draft: AgentInputDraft) {
-  const next = { ...drafts }
-  if (isEmptyAgentInputDraft(draft)) {
-    delete next[conversationId]
-  } else {
-    next[conversationId] = copyAgentInputDraft(draft)
-  }
-  return next
-}
-
-function saveActiveAgentInputDrafts(state: Pick<AppState, 'appMode' | 'activeAgentConversationId' | 'agentInputDrafts' | 'prompt' | 'inputImages' | 'maskDraft' | 'maskEditorImageId'>) {
-  if (state.appMode !== 'agent' || !state.activeAgentConversationId) return state.agentInputDrafts
-  return setAgentInputDraft(state.agentInputDrafts, state.activeAgentConversationId, getCurrentAgentInputDraft(state))
-}
-
-function saveGalleryInputDraft(state: Pick<AppState, 'appMode' | 'galleryInputDraft' | 'prompt' | 'inputImages' | 'maskDraft' | 'maskEditorImageId'>) {
-  if (state.appMode !== 'gallery') return state.galleryInputDraft
-  const draft = getCurrentAgentInputDraft(state)
-  return isEmptyAgentInputDraft(draft) ? null : copyAgentInputDraft(draft)
-}
-
-function getPersistableGalleryInputDraft(state: AppState) {
-  return saveGalleryInputDraft(state)
-}
-
-function restoreGalleryInputDraftState(draft: AgentInputDraft | null): Pick<AgentInputDraft, 'prompt' | 'inputImages' | 'maskDraft' | 'maskEditorImageId'> {
-  if (!draft) return clearInputDraftState()
-  return {
-    prompt: draft.prompt,
-    inputImages: draft.inputImages.map((img) => ({ ...img })),
-    maskDraft: draft.maskDraft ? { ...draft.maskDraft } : null,
-    maskEditorImageId: draft.maskEditorImageId,
-  }
-}
-
-function restoreAgentInputDraftState(drafts: Record<string, AgentInputDraft>, conversationId: string | null): Pick<AgentInputDraft, 'prompt' | 'inputImages' | 'maskDraft' | 'maskEditorImageId'> {
-  const draft = conversationId ? drafts[conversationId] : null
-  return restoreGalleryInputDraftState(draft ?? null)
-}
-
-function syncActiveInputDraft<T extends Partial<AgentInputDraft>>(
-  state: AppState,
-  patch: T,
-): T & { agentInputDrafts?: Record<string, AgentInputDraft>; galleryInputDraft?: AgentInputDraft | null } {
-  const draft: AgentInputDraft = {
-    prompt: patch.prompt ?? state.prompt,
-    inputImages: patch.inputImages ?? state.inputImages,
-    maskDraft: patch.maskDraft !== undefined ? patch.maskDraft : state.maskDraft,
-    maskEditorImageId: patch.maskEditorImageId !== undefined ? patch.maskEditorImageId : state.maskEditorImageId,
-  }
-  if (state.appMode === 'gallery') {
-    return {
-      ...patch,
-      galleryInputDraft: isEmptyAgentInputDraft(draft) ? null : copyAgentInputDraft(draft),
-    }
-  }
-  if (!state.activeAgentConversationId) return patch
-  return {
-    ...patch,
-    agentInputDrafts: setAgentInputDraft(state.agentInputDrafts, state.activeAgentConversationId, draft),
-  }
-}
-
-function getPersistableAgentInputDrafts(state: AppState) {
-  const drafts = saveActiveAgentInputDrafts(state)
-  const conversationIds = new Set(state.agentConversations.map((conversation) => conversation.id))
-  const persistable: Record<string, AgentInputDraft> = {}
-  for (const [conversationId, draft] of Object.entries(drafts)) {
-    if (!conversationIds.has(conversationId) || isEmptyAgentInputDraft(draft)) continue
-    persistable[conversationId] = {
-      ...copyAgentInputDraft(draft),
-      inputImages: draft.inputImages.map((img) => ({ id: img.id, dataUrl: '' })),
-    }
-  }
-  return persistable
-}
-
 export const useStore = create<AppState>()(
   persist(
     (set, get) => ({
@@ -978,12 +797,10 @@ export const useStore = create<AppState>()(
           if (s.inputImages.some((item, itemIdx) => itemIdx !== idx && item.id === img.id)) return s
           removedImageId = previous.id
           const inputImages = s.inputImages.map((item, itemIdx) => itemIdx === idx ? img : item)
-          const shouldClearMask = previous.id === s.maskDraft?.targetImageId
-          return syncActiveInputDraft(s, {
-            inputImages,
-            prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, inputImages, { [previous.id]: img.id }),
-            ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : {}),
-          })
+          return syncActiveInputDraft(s, updateInputDraftImages(s, inputImages, {
+            equivalentImageIds: { [previous.id]: img.id },
+            clearMissingMask: previous.id === s.maskDraft?.targetImageId,
+          }))
         })
         if (removedImageId) void deleteImageIfUnreferenced(removedImageId)
       },
@@ -991,19 +808,15 @@ export const useStore = create<AppState>()(
         set((s) => {
           const removed = s.inputImages[idx]
           const inputImages = s.inputImages.filter((_, i) => i !== idx)
-          const shouldClearMask = removed?.id === s.maskDraft?.targetImageId
-          return syncActiveInputDraft(s, {
-            inputImages,
-            prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, inputImages),
-            ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : {}),
-          })
+          return syncActiveInputDraft(s, updateInputDraftImages(s, inputImages, {
+            clearMissingMask: removed?.id === s.maskDraft?.targetImageId,
+          }))
         }),
       clearInputImages: () =>
         set((s) => {
           for (const img of s.inputImages) deleteCachedImage(img.id)
           return syncActiveInputDraft(s, {
-            inputImages: [],
-            prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, []),
+            ...updateInputDraftImages(s, []),
             maskDraft: null,
             maskEditorImageId: null,
           })
@@ -1011,13 +824,9 @@ export const useStore = create<AppState>()(
       setInputImages: (imgs, options) =>
         set((s) => {
           const inputImages = orderImagesWithMaskFirst(imgs, s.maskDraft?.targetImageId)
-          const shouldClearMask =
-            Boolean(s.maskDraft) && !inputImages.some((img) => img.id === s.maskDraft?.targetImageId)
-          return syncActiveInputDraft(s, {
-            inputImages,
-            prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, inputImages, options?.equivalentImageIds),
-            ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : {}),
-          })
+          return syncActiveInputDraft(s, updateInputDraftImages(s, inputImages, {
+            equivalentImageIds: options?.equivalentImageIds,
+          }))
         }),
       moveInputImage: (fromIdx, toIdx) =>
         set((s) => {
@@ -1031,10 +840,7 @@ export const useStore = create<AppState>()(
           if (insertIdx === fromIdx) return s
           const [moved] = images.splice(fromIdx, 1)
           images.splice(insertIdx, 0, moved)
-          return syncActiveInputDraft(s, {
-            inputImages: images,
-            prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, images),
-          })
+          return syncActiveInputDraft(s, updateInputDraftImages(s, images, { clearMissingMask: false }))
         }),
       maskDraft: null,
       setMaskDraft: (maskDraft) =>
@@ -1939,13 +1745,11 @@ export async function initStore() {
         cacheImage(img.id, storedImage.dataUrl)
       }
     }
-    const shouldClearMask = Boolean(galleryInputDraft.maskDraft) && !restoredGalleryImages.some((img) => img.id === galleryInputDraft.maskDraft?.targetImageId)
     const restoredGalleryDraft: AgentInputDraft = {
       ...galleryInputDraft,
-      inputImages: restoredGalleryImages,
-      prompt: remapImageMentionsForOrder(galleryInputDraft.prompt, galleryInputDraft.inputImages, restoredGalleryImages),
-      ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : {}),
+      ...updateInputDraftImages(galleryInputDraft, restoredGalleryImages),
     }
+    const shouldClearMask = galleryInputDraft.maskDraft !== restoredGalleryDraft.maskDraft
     const galleryDraftsChanged =
       restoredGalleryImages.length !== galleryInputDraft.inputImages.length ||
       restoredGalleryImages.some((img, index) => img.dataUrl !== galleryInputDraft.inputImages[index]?.dataUrl) ||
@@ -1979,13 +1783,11 @@ export async function initStore() {
       }
     }
 
-    const shouldClearMask = Boolean(draft.maskDraft) && !restoredDraftImages.some((img) => img.id === draft.maskDraft?.targetImageId)
     const restoredDraft: AgentInputDraft = {
       ...draft,
-      inputImages: restoredDraftImages,
-      prompt: remapImageMentionsForOrder(draft.prompt, draft.inputImages, restoredDraftImages),
-      ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : {}),
+      ...updateInputDraftImages(draft, restoredDraftImages),
     }
+    const shouldClearMask = draft.maskDraft !== restoredDraft.maskDraft
     if (!isEmptyAgentInputDraft(restoredDraft)) restoredAgentInputDrafts[conversationId] = restoredDraft
     if (
       restoredDraftImages.length !== draft.inputImages.length ||
@@ -4678,16 +4480,7 @@ async function deleteAgentRoundAndTasks(conversationId: string, roundId: string)
           : item
         return cleanDeletedAgentReferences(candidate, deletedTaskIds, removedAssistantMessageIds, now)
       })
-      const draft = latest.agentInputDrafts[conversationId]
-      const agentInputDrafts = draft
-        ? {
-            ...latest.agentInputDrafts,
-            [conversationId]: {
-              ...draft,
-              prompt: remapAgentRoundMentionsForPathChange(draft.prompt, oldActivePath, newActivePath),
-            },
-          }
-        : latest.agentInputDrafts
+      const agentInputDrafts = remapAgentInputDraftMentionsForPathChange(latest.agentInputDrafts, conversationId, oldActivePath, newActivePath)
       deleted = true
       return {
         agentConversations,
