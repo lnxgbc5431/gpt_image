@@ -942,7 +942,7 @@ export default function DetailModal() {
                         )
                       })}
                     </div>
-                    {isAgentEditTool && (
+                    {isAgentTask && (
                       <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
                         由模型自主选择，可能包含其他图片
                       </div>
