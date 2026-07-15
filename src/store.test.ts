@@ -134,7 +134,7 @@ import { callImageApi } from './lib/api'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { getFalQueuedImageResult } from './lib/falAiImageApi'
 import { removeKeyedBackgroundFromDataUrl } from './lib/transparentImage'
-import { clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
+import { clearFailedTasks, deleteFavoriteCollection, editOutputs, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, regenerateAgentAssistantMessage, removeMultipleTasks, removeTask, reuseConfig, stopAgentResponse, submitAgentMessage, submitTask, taskMatchesFilterStatus, taskMatchesSearchQuery, useStore } from './store'
 
 const commitTaskDeletionImplementation = vi.mocked(commitTaskDeletion).getMockImplementation()!
 const deleteDbImageImplementation = vi.mocked(deleteDbImage).getMockImplementation()!
@@ -530,36 +530,6 @@ describe('mask draft lifecycle in store actions', () => {
     const state = useStore.getState()
     expect(state.inputImages.map((img) => img.id)).toEqual([replacement.id, imageB.id])
     expect(state.prompt).toBe(prompt)
-  })
-})
-
-describe('interrupted OpenAI running tasks', () => {
-  it('marks legacy and OpenAI running tasks as interrupted', () => {
-    const now = 10_000
-    const legacyRunning = task({ id: 'legacy-running', status: 'running', createdAt: 1_000, finishedAt: null, elapsed: null })
-    const openAIRunning = task({ id: 'openai-running', apiProvider: 'openai', status: 'running', createdAt: 2_000, finishedAt: null, elapsed: null })
-    const falRunning = task({ id: 'fal-running', apiProvider: 'fal', status: 'running', createdAt: 3_000, finishedAt: null, elapsed: null })
-    const customAsyncRunning = task({ id: 'custom-running', apiProvider: 'custom-provider', customTaskId: 'task-1', status: 'running', createdAt: 4_000, finishedAt: null, elapsed: null })
-    const doneTask = task({ id: 'done-task', apiProvider: 'openai', status: 'done' })
-
-    const result = markInterruptedOpenAIRunningTasks([legacyRunning, openAIRunning, falRunning, customAsyncRunning, doneTask], now)
-
-    expect(result.interruptedTasks.map((item) => item.id)).toEqual(['legacy-running', 'openai-running'])
-    expect(result.tasks.find((item) => item.id === 'legacy-running')).toMatchObject({
-      status: 'error',
-      error: expect.stringContaining('请求中断'),
-      finishedAt: now,
-      elapsed: 9_000,
-    })
-    expect(result.tasks.find((item) => item.id === 'openai-running')).toMatchObject({
-      status: 'error',
-      error: expect.stringContaining('请求中断'),
-      finishedAt: now,
-      elapsed: 8_000,
-    })
-    expect(result.tasks.find((item) => item.id === 'fal-running')).toEqual(falRunning)
-    expect(result.tasks.find((item) => item.id === 'custom-running')).toEqual(customAsyncRunning)
-    expect(result.tasks.find((item) => item.id === 'done-task')).toEqual(doneTask)
   })
 })
 

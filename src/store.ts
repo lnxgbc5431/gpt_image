@@ -65,6 +65,7 @@ import { canonicalizeBatchFunctionCallArguments, countResponseToolCalls, createR
 import { cleanStaleAgentInputDrafts, clearInputDraftState, isEmptyAgentInputDraft, normalizeAgentInputDrafts, remapAgentInputDraftMentionsForPathChange, restoreAgentInputDraftState, restoreGalleryInputDraftState, saveActiveAgentInputDrafts, saveGalleryInputDraft, syncActiveInputDraft, updateInputDraftImages } from './lib/inputDraftState'
 import { ALL_FAVORITES_COLLECTION_ID, DEFAULT_FAVORITE_COLLECTION_ID, createDefaultFavoriteCollection, deleteFavoriteCollectionState, ensureDefaultFavoriteCollection, getTaskFavoriteCollectionIds, mergeFavoriteCollections, normalizeFavoriteCollectionIds, normalizeFavoriteCollectionName, normalizeFavoriteCollections, normalizeFavoritePatch, normalizeLoadedFavoriteState, resolveDefaultFavoriteCollectionId, sameFavoriteCollectionIds } from './lib/favoriteState'
 import { createPersistedState, mergePersistedAgentConversations, migratePersistedState, normalizePersistedState } from './lib/persistedState'
+import { addImageSizeParam, createTaskDonePatch, createTaskErrorPatch, deriveAgentImageActualParams, deriveGalleryActualParams, firstActualParams, hasActualParams, hasActualSizeParam, mapActualParamsByImage, mapRevisedPromptsByImage, markInterruptedOpenAIRunningTasks } from './lib/taskState'
 
 const FAL_RECOVERY_POLL_MS = 10_000
 const CUSTOM_RECOVERY_POLL_MS = 10_000
@@ -77,7 +78,6 @@ const agentRecoveryContinuations = new Set<string>()
 const deletedActiveAgentTasks = new Map<string, { task: TaskRecord; controller: AbortController }>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
-const OPENAI_INTERRUPTED_ERROR = '请求中断'
 const AGENT_STOPPED_MESSAGE = '已停止生成。'
 const AGENT_RECOVERY_PAUSE_ERROR = 'AgentRecoveryPauseError'
 const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
@@ -1001,12 +1001,8 @@ export function getCodexCliPromptKey(settings: AppSettings): string {
   return `${profile.baseUrl}\n${profile.apiKey}`
 }
 
-function isOpenAITask(task: TaskRecord) {
-  return (task.apiProvider ?? 'openai') !== 'fal'
-}
-
 function isRunningOpenAITask(task: TaskRecord) {
-  return task.status === 'running' && isOpenAITask(task)
+  return task.status === 'running' && (task.apiProvider ?? 'openai') !== 'fal'
 }
 
 function isAsyncCustomProviderTask(settings: AppSettings, provider: string, hasInputImages: boolean) {
@@ -1014,26 +1010,6 @@ function isAsyncCustomProviderTask(settings: AppSettings, provider: string, hasI
   if (!customProvider?.poll) return false
   const submitMapping = hasInputImages && customProvider.editSubmit ? customProvider.editSubmit : customProvider.submit
   return Boolean(submitMapping.taskIdPath)
-}
-
-export function markInterruptedOpenAIRunningTasks(tasks: TaskRecord[], now = Date.now()) {
-  const interruptedTasks: TaskRecord[] = []
-  const updatedTasks = tasks.map((task) => {
-    if (!isRunningOpenAITask(task) || task.customTaskId) return task
-
-    const updated: TaskRecord = {
-      ...task,
-      status: 'error',
-      error: OPENAI_INTERRUPTED_ERROR,
-      falRecoverable: false,
-      finishedAt: now,
-      elapsed: Math.max(0, now - task.createdAt),
-    }
-    interruptedTasks.push(updated)
-    return updated
-  })
-
-  return { tasks: updatedTasks, interruptedTasks }
 }
 
 function clearOpenAIWatchdogTimer(taskId: string) {
@@ -1047,10 +1023,8 @@ function failOpenAITaskIfStillRunning(taskId: string, error: string, now = Date.
   if (!task || !isRunningOpenAITask(task)) return false
 
   updateTaskInStore(taskId, {
-    status: 'error',
-    error,
+    ...createTaskErrorPatch(task, error, now),
     falRecoverable: false,
-    finishedAt: now,
     elapsed: Math.max(0, now - task.createdAt),
   })
   return true
@@ -1280,42 +1254,6 @@ function scheduleCustomRecovery(taskId: string, delayMs = CUSTOM_RECOVERY_POLL_M
   customRecoveryTimers.set(taskId, timer)
 }
 
-function hasActualParams(params: Partial<TaskParams> | undefined): params is Partial<TaskParams> {
-  return Boolean(params && Object.keys(params).length > 0)
-}
-
-function firstActualParams(paramsList: Array<Partial<TaskParams> | undefined> | undefined): Partial<TaskParams> | undefined {
-  return paramsList?.find(hasActualParams)
-}
-
-function mapActualParamsByImage(outputIds: string[], paramsList: Array<Partial<TaskParams> | undefined> | undefined) {
-  const mapped = paramsList?.reduce<Record<string, Partial<TaskParams>>>((acc, params, index) => {
-    const imgId = outputIds[index]
-    if (imgId && hasActualParams(params)) acc[imgId] = params
-    return acc
-  }, {})
-  return mapped && Object.keys(mapped).length > 0 ? mapped : undefined
-}
-
-function getImageSizeParam(size: { width?: number; height?: number } | undefined): Partial<TaskParams> | undefined {
-  if (!size?.width || !size.height) return undefined
-  return { size: `${size.width}x${size.height}` }
-}
-
-function hasActualSizeParam(params: Partial<TaskParams> | undefined) {
-  return Boolean(params?.size)
-}
-
-function addImageSizeParam(
-  params: Partial<TaskParams> | undefined,
-  size: { width?: number; height?: number } | undefined,
-): Partial<TaskParams> | undefined {
-  if (hasActualSizeParam(params)) return params
-  const sizeParam = getImageSizeParam(size)
-  if (!sizeParam) return params
-  return { ...(params ?? {}), ...sizeParam }
-}
-
 async function readImageSizeParam(dataUrl: string): Promise<Partial<TaskParams> | undefined> {
   if (typeof Image === 'undefined') return undefined
 
@@ -1386,11 +1324,8 @@ async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<Return
     actualParams: firstActualParams(actualParamsList),
     actualParamsByImage: mapActualParamsByImage(outputIds, actualParamsList),
     revisedPromptByImage: undefined,
-    status: 'done',
-    error: null,
+    ...createTaskDonePatch(task, Date.now()),
     falRecoverable: false,
-    finishedAt: Date.now(),
-    elapsed: Date.now() - task.createdAt,
   })
   useStore.getState().showToast(`fal.ai 任务已恢复，共 ${outputIds.length} 张图片`, 'success')
   if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `fal.ai 任务已恢复，共 ${outputIds.length} 张图片。`)
@@ -1422,12 +1357,9 @@ async function recoverFalTask(taskId: string) {
 
     clearFalRecoveryTimer(taskId)
     updateTaskInStore(taskId, {
-      status: 'error',
-      error: getFalErrorMessage(err) ?? (err instanceof Error ? err.message : String(err)),
+      ...createTaskErrorPatch(task, getFalErrorMessage(err) ?? (err instanceof Error ? err.message : String(err)), Date.now()),
       ...getRawErrorPayload(err),
       falRecoverable: false,
-      finishedAt: Date.now(),
-      elapsed: Date.now() - task.createdAt,
     })
     if (isAgentTask(task)) void continueRecoveredAgentRound(taskId)
   }
@@ -1471,7 +1403,7 @@ export async function initStore() {
   if (shouldRewritePersistedLocalState) {
     useStore.setState({})
   }
-  const { tasks: markedTasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(storedTasks)
+  const { tasks: markedTasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(storedTasks, Date.now())
   const interruptedTaskIds = new Set(interruptedTasks.map((task) => task.id))
   const favoriteState = useStore.getState()
   const normalizedFavorites = normalizeLoadedFavoriteState(markedTasks.map(getPersistableTask), favoriteState.favoriteCollections, favoriteState.defaultFavoriteCollectionId)
@@ -1822,11 +1754,9 @@ function markAgentRoundTasksStopped(conversationId: string, roundId: string, now
     clearFalRecoveryTimer(task.id)
     clearCustomRecoveryTimer(task.id)
     updateTaskInStore(task.id, {
-      status: 'error',
-      error: AGENT_STOPPED_MESSAGE,
+      ...createTaskErrorPatch(task, AGENT_STOPPED_MESSAGE, now),
       falRecoverable: false,
       customRecoverable: false,
-      finishedAt: now,
       elapsed: Math.max(0, now - task.createdAt),
     })
   }
@@ -1851,12 +1781,10 @@ function markAgentRoundTasksFailed(
   for (const task of runningTasks) {
     useStore.getState().setTaskStreamPreview(task.id)
     updateTaskInStore(task.id, {
-      status: 'error',
-      error,
+      ...createTaskErrorPatch(task, error, now),
       ...(rawResponsePayload ? { rawResponsePayload } : {}),
       falRecoverable: false,
       customRecoverable: false,
-      finishedAt: now,
       elapsed: Math.max(0, now - task.createdAt),
     })
   }
@@ -2684,11 +2612,7 @@ async function executeAgentRound(
         await deleteUnreferencedImageIds([stored.id])
         return { taskId, committed: false }
       }
-      const actualParams: Partial<TaskParams> = {
-        ...(Object.keys(image.actualParams ?? {}).length ? image.actualParams : {}),
-        ...(!hasActualSizeParam(image.actualParams) ? getImageSizeParam(stored) ?? {} : {}),
-        n: 1,
-      }
+      const actualParams = deriveAgentImageActualParams(image.actualParams, stored)
       updateTaskInStore(taskId, {
         prompt: image.revisedPrompt ?? latestBeforeUpdate.prompt,
         outputImages: [stored.id],
@@ -2696,10 +2620,7 @@ async function executeAgentRound(
         actualParamsByImage: { [stored.id]: actualParams },
         revisedPromptByImage: image.revisedPrompt ? { [stored.id]: image.revisedPrompt } : undefined,
         rawResponsePayload,
-        status: 'done',
-        error: null,
-        finishedAt: Date.now(),
-        elapsed: Date.now() - latestBeforeUpdate.createdAt,
+        ...createTaskDonePatch(latestBeforeUpdate, Date.now()),
         agentToolAction: image.action,
       })
       useStore.getState().setTaskStreamPreview(taskId)
@@ -2714,13 +2635,10 @@ async function executeAgentRound(
 
       useStore.getState().setTaskStreamPreview(taskId)
       updateTaskInStore(taskId, {
-        status: 'error',
-        error,
+        ...createTaskErrorPatch(latestTask, error, Date.now()),
         rawResponsePayload,
         falRecoverable: false,
         customRecoverable: false,
-        finishedAt: Date.now(),
-        elapsed: Date.now() - latestTask.createdAt,
       })
     }
 
@@ -2733,11 +2651,8 @@ async function executeAgentRound(
       if (latestTask.apiProvider === 'fal' && latestTask.falRequestId && latestTask.falEndpoint) {
         useStore.getState().setTaskStreamPreview(taskId)
         updateTaskInStore(taskId, {
-          status: 'error',
-          error: '与 fal.ai 的连接已断开，之后会继续查询任务结果。',
+          ...createTaskErrorPatch(latestTask, '与 fal.ai 的连接已断开，之后会继续查询任务结果。', Date.now()),
           falRecoverable: true,
-          finishedAt: Date.now(),
-          elapsed: Date.now() - latestTask.createdAt,
         })
         scheduleFalRecovery(taskId)
         return true
@@ -2746,11 +2661,8 @@ async function executeAgentRound(
       if (latestTask.customTaskId) {
         useStore.getState().setTaskStreamPreview(taskId)
         updateTaskInStore(taskId, {
-          status: 'error',
-          error: '与自定义异步任务的连接已断开，之后会继续查询任务结果。',
+          ...createTaskErrorPatch(latestTask, '与自定义异步任务的连接已断开，之后会继续查询任务结果。', Date.now()),
           customRecoverable: true,
-          finishedAt: Date.now(),
-          elapsed: Date.now() - latestTask.createdAt,
         })
         scheduleCustomRecovery(taskId)
         return true
@@ -3231,11 +3143,7 @@ async function executeAgentRound(
         const promptRefs = await resolveReferenceImages(promptRefIds)
         const stored = await storeImageWithSize(image.dataUrl, 'generated')
         cacheImage(stored.id, image.dataUrl)
-        const actualParams: Partial<TaskParams> = {
-          ...(Object.keys(image.actualParams ?? {}).length ? image.actualParams : {}),
-          ...(!hasActualSizeParam(image.actualParams) ? getImageSizeParam(stored) ?? {} : {}),
-          n: 1,
-        }
+        const actualParams = deriveAgentImageActualParams(image.actualParams, stored)
         const task: TaskRecord = {
           id: genId(),
           prompt: image.revisedPrompt ?? round?.prompt ?? userMessage.content,
@@ -3531,12 +3439,9 @@ async function executeTask(taskId: string) {
   const taskProfile = getTaskApiProfile(settings, task)
   if (!taskProfile && task.apiProfileId) {
     updateTaskInStore(taskId, {
-      status: 'error',
-      error: '找不到此任务所使用的 API 配置。',
+      ...createTaskErrorPatch(task, '找不到此任务所使用的 API 配置。', Date.now()),
       falRecoverable: false,
       customRecoverable: false,
-      finishedAt: Date.now(),
-      elapsed: Date.now() - task.createdAt,
     })
     return
   }
@@ -3617,23 +3522,10 @@ async function executeTask(taskId: string) {
       isAsyncCustomTask ? undefined : result.actualParamsList,
       outputImageSizes,
     )
-    const actualParams = (() => {
-      if (taskProvider === 'fal') return firstActualParams(actualParamsList)
-      if (isAsyncCustomTask) return firstActualParams(actualParamsList)
-      const firstParams = firstActualParams(actualParamsList)
-      return {
-        ...result.actualParams,
-        size: result.actualParams?.size ?? firstParams?.size,
-        n: outputIds.length,
-      }
-    })()
+    const actualParams = deriveGalleryActualParams(taskProvider, isAsyncCustomTask, result.actualParams, actualParamsList, outputIds.length)
     const shouldStoreRevisedPrompts = taskProvider !== 'fal' && !isAsyncCustomTask
     const actualParamsByImage = mapActualParamsByImage(outputIds, actualParamsList)
-    const revisedPromptByImage = shouldStoreRevisedPrompts ? result.revisedPrompts?.reduce<Record<string, string>>((acc, revisedPrompt, index) => {
-      const imgId = outputIds[index]
-      if (imgId && revisedPrompt && revisedPrompt.trim()) acc[imgId] = revisedPrompt
-      return acc
-    }, {}) : undefined
+    const revisedPromptByImage = shouldStoreRevisedPrompts ? mapRevisedPromptsByImage(outputIds, result.revisedPrompts) : undefined
     const promptWasRevised = shouldStoreRevisedPrompts && result.revisedPrompts?.some(
       (revisedPrompt) => revisedPrompt?.trim() && revisedPrompt.trim() !== requestPrompt.trim(),
     )
@@ -3664,10 +3556,8 @@ async function executeTask(taskId: string) {
       rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
       actualParams,
       actualParamsByImage,
-      revisedPromptByImage: revisedPromptByImage && Object.keys(revisedPromptByImage).length > 0 ? revisedPromptByImage : undefined,
-      status: 'done',
-      finishedAt: Date.now(),
-      elapsed: Date.now() - task.createdAt,
+      revisedPromptByImage,
+      ...createTaskDonePatch(task, Date.now()),
       falRecoverable: false,
       customRecoverable: false,
     })
@@ -3699,23 +3589,17 @@ async function executeTask(taskId: string) {
     const latestCustomTaskInfo = customTaskInfo ?? (latestTask.customTaskId ? { taskId: latestTask.customTaskId } : null)
     if (latestTask.apiProvider === 'fal' && latestFalRequestInfo && isNetworkRecoverableError(err)) {
       updateTaskInStore(taskId, {
-        status: 'error',
-        error: '与 fal.ai 的连接已断开，之后会继续查询任务结果。',
+        ...createTaskErrorPatch(task, '与 fal.ai 的连接已断开，之后会继续查询任务结果。', Date.now()),
         falRequestId: latestFalRequestInfo.requestId,
         falEndpoint: latestFalRequestInfo.endpoint,
         falRecoverable: true,
-        finishedAt: Date.now(),
-        elapsed: Date.now() - task.createdAt,
       })
       scheduleFalRecovery(taskId)
     } else if (latestCustomTaskInfo && isNetworkRecoverableError(err)) {
       updateTaskInStore(taskId, {
-        status: 'error',
-        error: '与自定义异步任务的连接已断开，之后会继续查询任务结果。',
+        ...createTaskErrorPatch(task, '与自定义异步任务的连接已断开，之后会继续查询任务结果。', Date.now()),
         customTaskId: latestCustomTaskInfo.taskId,
         customRecoverable: true,
-        finishedAt: Date.now(),
-        elapsed: Date.now() - task.createdAt,
       })
       scheduleCustomRecovery(taskId)
     } else {
@@ -3735,13 +3619,10 @@ async function executeTask(taskId: string) {
         errorMessage += `\n${networkErrorHint}`
       }
       updateTaskInStore(taskId, {
-        status: 'error',
-        error: errorMessage,
+        ...createTaskErrorPatch(task, errorMessage, Date.now()),
         ...getRawErrorPayload(err),
         falRecoverable: false,
         customRecoverable: false,
-        finishedAt: Date.now(),
-        elapsed: Date.now() - task.createdAt,
       })
       useStore.getState().setDetailTaskId(taskId)
     }
@@ -4278,11 +4159,8 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
     actualParams: firstActualParams(actualParamsList),
     actualParamsByImage: mapActualParamsByImage(outputIds, actualParamsList),
     revisedPromptByImage: undefined,
-    status: 'done',
-    error: null,
+    ...createTaskDonePatch(task, Date.now()),
     customRecoverable: false,
-    finishedAt: Date.now(),
-    elapsed: Date.now() - task.createdAt,
   })
   useStore.getState().showToast(`自定义异步任务已恢复，共 ${outputIds.length} 张图片`, 'success')
   if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `自定义异步任务已恢复，共 ${outputIds.length} 张图片。`)
@@ -4309,12 +4187,9 @@ async function recoverCustomTask(taskId: string) {
     clearCustomRecoveryTimer(taskId)
     if (!useStore.getState().tasks.some((item) => item.id === taskId)) return
     updateTaskInStore(taskId, {
-      status: 'error',
-      error: err instanceof Error ? err.message : String(err),
+      ...createTaskErrorPatch(task, err instanceof Error ? err.message : String(err), Date.now()),
       ...getRawErrorPayload(err),
       customRecoverable: false,
-      finishedAt: Date.now(),
-      elapsed: Date.now() - task.createdAt,
     })
     if (isAgentTask(task)) void continueRecoveredAgentRound(taskId)
   }
